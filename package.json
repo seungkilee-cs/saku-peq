@@ -4,14 +4,19 @@
   "description": "Standalone 10-band parametric EQ utilities with frequency response calculation, extracted from Saku Audio Player",
   "license": "MIT",
   "type": "module",
-  "main": "src/index.js",
-  "module": "src/index.js",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
   },
   "files": [
-    "src",
-    "examples"
+    "dist",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "peq",
@@ -23,5 +28,16 @@
     "biquad",
     "frequency-response",
     "visualization"
-  ]
+  ],
+  "scripts": {
+    "build": "tsup src/index.js --format esm,cjs --dts --out-dir dist",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:test-app": "node scripts/serve-test-app.mjs"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.1",
+    "vitest": "^3.2.4"
+  }
 }

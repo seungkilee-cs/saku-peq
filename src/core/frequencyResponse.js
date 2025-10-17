@@ -10,6 +10,65 @@
  * @param {number} numPoints - Number of frequency points to generate
  * @returns {Float32Array} Array of frequencies in Hz
  */
+export const DEFAULT_SAMPLE_RATE = 48000;
+export const MIN_GAIN_DB = -48;
+export const MAX_GAIN_DB = 48;
+const GAIN_EPSILON = 1e-3;
+const MIN_Q = 1e-6;
+const MIN_SLOPE = 1e-6;
+
+function normalizeCoefficients(b0, b1, b2, a0, a1, a2) {
+  if (!Number.isFinite(a0) || Math.abs(a0) < Number.EPSILON) {
+    return null;
+  }
+  const invA0 = 1 / a0;
+  return {
+    b0: b0 * invA0,
+    b1: b1 * invA0,
+    b2: b2 * invA0,
+    a1: a1 * invA0,
+    a2: a2 * invA0
+  };
+}
+
+function biquadMagnitudeDb(coefficients, w) {
+  if (!coefficients) {
+    return 0;
+  }
+
+  const { b0, b1, b2, a1, a2 } = coefficients;
+  const cosw = Math.cos(w);
+  const sinw = Math.sin(w);
+  const cos2w = Math.cos(2 * w);
+  const sin2w = Math.sin(2 * w);
+
+  const numReal = b0 + b1 * cosw + b2 * cos2w;
+  const numImag = b1 * -sinw + b2 * -sin2w;
+  const denReal = 1 + a1 * cosw + a2 * cos2w;
+  const denImag = a1 * -sinw + a2 * -sin2w;
+
+  const numMagSquared = numReal * numReal + numImag * numImag;
+  const denMagSquared = denReal * denReal + denImag * denImag;
+
+  if (!Number.isFinite(numMagSquared) || !Number.isFinite(denMagSquared) || denMagSquared === 0) {
+    return 0;
+  }
+
+  const magnitude = Math.sqrt(numMagSquared / denMagSquared);
+  if (!Number.isFinite(magnitude) || magnitude <= 0) {
+    return 0;
+  }
+
+  return 20 * Math.log10(magnitude);
+}
+
+function clampDb(value) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(MIN_GAIN_DB, Math.min(MAX_GAIN_DB, value));
+}
+
 export function generateFrequencies(numPoints = 512) {
   const frequencies = new Float32Array(numPoints);
   const minFreq = 20;
@@ -35,99 +94,120 @@ export function generateFrequencies(numPoints = 512) {
  * @param {string} band.type - Filter type ('peaking', 'lowshelf', 'highshelf', 'lowpass', 'highpass')
  * @returns {number} Response in dB
  */
-export function calculateBandResponse(frequency, band) {
-  const { frequency: centerFreq, gain, Q, type } = band;
-  
-  if (!centerFreq || !gain || Math.abs(gain) < 0.001) {
+export function calculateBandResponse(frequency, band, options = {}) {
+  if (!band) {
     return 0;
   }
-  
-  const qFactor = Q || 1.0;
-  
+
+  const centerFreq = band.frequency;
+  if (!Number.isFinite(centerFreq) || centerFreq <= 0) {
+    return 0;
+  }
+
+  if (!Number.isFinite(frequency) || frequency <= 0) {
+    return 0;
+  }
+
+  const type = band.type || 'peaking';
+  const gain = Number.isFinite(band.gain) ? band.gain : 0;
+  const qValue = Math.max(Number.isFinite(band.Q) ? band.Q : 1, MIN_Q);
+  const slope = Math.max(band.S ?? band.s ?? qValue, MIN_SLOPE);
+
+  if (Math.abs(gain) < GAIN_EPSILON && (type === 'peaking' || type === 'lowshelf' || type === 'highshelf')) {
+    return 0;
+  }
+
+  const sampleRate = options.sampleRate ?? band.sampleRate ?? DEFAULT_SAMPLE_RATE;
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) {
+    return 0;
+  }
+
+  const nyquist = sampleRate / 2;
+  const targetFreq = Math.min(Math.max(frequency, 0), nyquist * 0.999999);
+  const w0 = (2 * Math.PI * centerFreq) / sampleRate;
+  const cosw0 = Math.cos(w0);
+  const sinw0 = Math.sin(w0);
+
+  let coefficients = null;
+
   switch (type) {
     case 'peaking': {
-      // Simple but accurate peaking EQ response using bell curve
-      // This creates the classic bell-shaped response curve
-      
-      // Calculate frequency ratio (how far we are from center frequency)
-      const ratio = frequency / centerFreq;
-      const logRatio = Math.log2(ratio);
-      
-      // Bandwidth calculation: higher Q = narrower bandwidth
-      // Q of 1.0 gives about 2 octave bandwidth, Q of 0.5 gives about 4 octaves
-      const bandwidth = 2.0 / qFactor; // octaves
-      
-      // Bell curve calculation using Gaussian-like function
-      // The response falls off as we move away from center frequency
-      const normalizedDistance = Math.abs(logRatio) / (bandwidth / 2);
-      
-      // Use a smooth bell curve that approaches the gain at center frequency
-      // and falls off smoothly on both sides
-      let response;
-      if (normalizedDistance <= 0.01) {
-        // Very close to center frequency - return full gain
-        response = 1.0;
-      } else {
-        // Bell curve falloff - this creates the smooth peaking response
-        response = 1.0 / (1.0 + Math.pow(normalizedDistance * 2, 2));
-      }
-      
-      return gain * response;
+      const A = Math.pow(10, gain / 40);
+      const alpha = sinw0 / (2 * qValue);
+      const b0 = 1 + alpha * A;
+      const b1 = -2 * cosw0;
+      const b2 = 1 - alpha * A;
+      const a0 = 1 + alpha / A;
+      const a1 = -2 * cosw0;
+      const a2 = 1 - alpha / A;
+      coefficients = normalizeCoefficients(b0, b1, b2, a0, a1, a2);
+      break;
     }
-    
+
     case 'lowshelf': {
-      // Low shelf: full gain below cutoff, smooth transition above
-      const ratio = frequency / centerFreq;
-      if (ratio <= 1) {
-        return gain;
-      } else {
-        // Smooth rolloff above cutoff frequency
-        const octaves = Math.log2(ratio);
-        const rolloff = 1.0 / (1.0 + octaves * qFactor);
-        return gain * rolloff;
-      }
+      const A = Math.pow(10, gain / 40);
+      const alphaTerm = Math.max(0, (A + 1 / A) * (1 / slope - 1) + 2);
+      const alpha = (sinw0 / 2) * Math.sqrt(alphaTerm);
+      const beta = 2 * Math.sqrt(A) * alpha;
+      const b0 = A * ((A + 1) - (A - 1) * cosw0 + beta);
+      const b1 = 2 * A * ((A - 1) - (A + 1) * cosw0);
+      const b2 = A * ((A + 1) - (A - 1) * cosw0 - beta);
+      const a0 = (A + 1) + (A - 1) * cosw0 + beta;
+      const a1 = -2 * ((A - 1) + (A + 1) * cosw0);
+      const a2 = (A + 1) + (A - 1) * cosw0 - beta;
+      coefficients = normalizeCoefficients(b0, b1, b2, a0, a1, a2);
+      break;
     }
-    
+
     case 'highshelf': {
-      // High shelf: full gain above cutoff, smooth transition below
-      const ratio = frequency / centerFreq;
-      if (ratio >= 1) {
-        return gain;
-      } else {
-        // Smooth rolloff below cutoff frequency
-        const octaves = Math.log2(1 / ratio);
-        const rolloff = 1.0 / (1.0 + octaves * qFactor);
-        return gain * rolloff;
-      }
+      const A = Math.pow(10, gain / 40);
+      const alphaTerm = Math.max(0, (A + 1 / A) * (1 / slope - 1) + 2);
+      const alpha = (sinw0 / 2) * Math.sqrt(alphaTerm);
+      const beta = 2 * Math.sqrt(A) * alpha;
+      const b0 = A * ((A + 1) + (A - 1) * cosw0 + beta);
+      const b1 = -2 * A * ((A - 1) + (A + 1) * cosw0);
+      const b2 = A * ((A + 1) + (A - 1) * cosw0 - beta);
+      const a0 = (A + 1) - (A - 1) * cosw0 + beta;
+      const a1 = 2 * ((A - 1) - (A + 1) * cosw0);
+      const a2 = (A + 1) - (A - 1) * cosw0 - beta;
+      coefficients = normalizeCoefficients(b0, b1, b2, a0, a1, a2);
+      break;
     }
-    
+
     case 'lowpass': {
-      // Low pass filter response
-      const ratio = frequency / centerFreq;
-      if (ratio <= 1) {
-        return 0; // No change in passband
-      } else {
-        // Rolloff above cutoff
-        const octaves = Math.log2(ratio);
-        return -6 * octaves * qFactor; // 6dB/octave per Q
-      }
+      const alpha = sinw0 / (2 * qValue);
+      const b0 = (1 - cosw0) / 2;
+      const b1 = 1 - cosw0;
+      const b2 = (1 - cosw0) / 2;
+      const a0 = 1 + alpha;
+      const a1 = -2 * cosw0;
+      const a2 = 1 - alpha;
+      coefficients = normalizeCoefficients(b0, b1, b2, a0, a1, a2);
+      break;
     }
-    
+
     case 'highpass': {
-      // High pass filter response
-      const ratio = frequency / centerFreq;
-      if (ratio >= 1) {
-        return 0; // No change in passband
-      } else {
-        // Rolloff below cutoff
-        const octaves = Math.log2(1 / ratio);
-        return -6 * octaves * qFactor; // 6dB/octave per Q
-      }
+      const alpha = sinw0 / (2 * qValue);
+      const b0 = (1 + cosw0) / 2;
+      const b1 = -(1 + cosw0);
+      const b2 = (1 + cosw0) / 2;
+      const a0 = 1 + alpha;
+      const a1 = -2 * cosw0;
+      const a2 = 1 - alpha;
+      coefficients = normalizeCoefficients(b0, b1, b2, a0, a1, a2);
+      break;
     }
-    
+
     default:
       return 0;
   }
+
+  if (!coefficients) {
+    return 0;
+  }
+
+  const w = (2 * Math.PI * targetFreq) / sampleRate;
+  return biquadMagnitudeDb(coefficients, w);
 }
 
 /**
@@ -140,7 +220,7 @@ export function calculateBandResponse(frequency, band) {
  * @returns {Object} Object with frequencies array and magnitudeDb array
  */
 export function calculateFrequencyResponse(bands, options = {}) {
-  const { numPoints = 512, minFreq = 20, maxFreq = 20000 } = options;
+  const { numPoints = 512, minFreq = 20, maxFreq = 20000, sampleRate = DEFAULT_SAMPLE_RATE } = options;
   
   // Generate frequency points
   const frequencies = new Float32Array(numPoints);
@@ -158,18 +238,19 @@ export function calculateFrequencyResponse(bands, options = {}) {
   for (let i = 0; i < numPoints; i++) {
     const freq = frequencies[i];
     let totalGain = 0;
-    
-    // Sum contributions from all bands
-    bands.forEach(band => {
-      if (!band || typeof band.gain !== 'number' || Math.abs(band.gain) < 0.001) {
-        return; // Skip flat bands
+
+    bands.forEach((band) => {
+      if (!band) {
+        return;
       }
-      
-      const bandResponse = calculateBandResponse(freq, band);
-      totalGain += bandResponse;
+
+      const bandResponse = calculateBandResponse(freq, band, { sampleRate });
+      if (Number.isFinite(bandResponse)) {
+        totalGain += bandResponse;
+      }
     });
-    
-    magnitudeDb[i] = Math.max(-48, Math.min(48, totalGain)); // Clamp to reasonable range
+
+    magnitudeDb[i] = clampDb(totalGain);
   }
   
   return {
@@ -198,19 +279,22 @@ export function calculateProcessorResponse(peqState, options = {}) {
  * @param {Array} targetFrequencies - Array of frequencies to calculate response for
  * @returns {Array} Array of response values in dB
  */
-export function getResponseAtFrequencies(bands, targetFrequencies) {
+export function getResponseAtFrequencies(bands, targetFrequencies, options = {}) {
+  const sampleRate = options.sampleRate ?? DEFAULT_SAMPLE_RATE;
   return targetFrequencies.map(freq => {
     let totalGain = 0;
     
     bands.forEach(band => {
-      if (!band || typeof band.gain !== 'number' || Math.abs(band.gain) < 0.001) {
+      if (!band) {
         return;
       }
       
-      const bandResponse = calculateBandResponse(freq, band);
-      totalGain += bandResponse;
+      const bandResponse = calculateBandResponse(freq, band, { sampleRate });
+      if (Number.isFinite(bandResponse)) {
+        totalGain += bandResponse;
+      }
     });
     
-    return Math.max(-48, Math.min(48, totalGain));
+    return clampDb(totalGain);
   });
 }
