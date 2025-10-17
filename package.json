@@ -1,5 +1,5 @@
 {
-  "name": "@saku/peq-10band",
+  "name": "saku-peq",
   "version": "0.1.0",
   "description": "Standalone 10-band parametric EQ utilities with frequency response calculation, extracted from Saku Audio Player",
   "license": "MIT",
@@ -14,7 +14,6 @@
   },
   "files": [
     "dist",
-    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
@@ -33,8 +32,7 @@
     "build": "tsup src/index.js --format esm,cjs --dts --out-dir dist",
     "clean": "rm -rf dist",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "dev:test-app": "node scripts/serve-test-app.mjs"
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "tsup": "^8.0.1",
